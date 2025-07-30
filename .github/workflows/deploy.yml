@@ -5,12 +5,12 @@ on:
     branches:
       - dev
       - staging
-      - main 
+      - production 
   pull_request: 
     branches:
       - dev
       - staging
-      - main
+      - production
   workflow_dispatch:
     inputs:
       rollback_tag:
@@ -87,13 +87,13 @@ jobs:
           overwrite: true
 
   deploy:
-    name: Deploy to ${{ github.ref == 'refs/heads/main' && 'Production' || (github.ref == 'refs/heads/staging' && 'Staging' || 'Development') }}
+    name: Deploy to ${{ github.ref == 'refs/heads/production' && 'Production' || (github.ref == 'refs/heads/staging' && 'Staging' || 'Development') }}
     needs: build
     runs-on: ubuntu-latest
     # Manual approval for production
     environment:
-      name: ${{ github.ref == 'refs/heads/main' && 'production' || (github.ref == 'refs/heads/staging' && 'staging' || 'development') }}
-      url: ${{ github.ref == 'refs/heads/main' && 'https://your-production-url.com' || github.ref == 'refs/heads/staging' && 'https://your-staging-url.com' || 'https://your-dev-url.com' }}
+      name: ${{ github.ref == 'refs/heads/production' && 'production' || (github.ref == 'refs/heads/staging' && 'staging' || 'development') }}
+      url: ${{ github.ref == 'refs/heads/production' && 'https://your-production-url.com' || github.ref == 'refs/heads/staging' && 'https://your-staging-url.com' || 'https://your-dev-url.com' }}
 
     steps:
       - name: Download build artifact
@@ -135,7 +135,7 @@ jobs:
             echo "SERVER_IP=${{ secrets.STAGING_SERVER_IP }}" >> $GITHUB_OUTPUT
             echo "SSH_KEY=${{ secrets.STAGING_EC2_SSH_KEY }}" >> $GITHUB_OUTPUT
             echo "APP_DIR=${{ secrets.STAGING_APP_DIR }}" >> $GITHUB_OUTPUT # e.g., /var/www/staging-app
-          elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+          elif [[ "${{ github.ref }}" == "refs/heads/production" ]]; then
             echo "DEPLOY_ENV=production" >> $GITHUB_OUTPUT
             echo "SERVER_IP=${{ secrets.PROD_SERVER_IP }}" >> $GITHUB_OUTPUT
             echo "SSH_KEY=${{ secrets.PROD_EC2_SSH_KEY }}" >> $GITHUB_OUTPUT
@@ -147,7 +147,7 @@ jobs:
           echo "--- Deployment variables set ---"
 
       - name: Save Git Tag for Production (only on main branch)
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/production'
         run: |
           echo "--- Tagging production deployment ---"
           git config user.name "github-actions[bot]"
