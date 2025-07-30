@@ -6,7 +6,7 @@ on:
       - dev
       - staging
       - main 
-  pull_request: # Good practice to lint/test PRs before merging
+  pull_request: 
     branches:
       - dev
       - staging
@@ -30,10 +30,10 @@ on:
 
 
 permissions:
-  contents: read # Allow checkout
-  actions: write # Allow workflow_dispatch for rollback
-  pull-requests: write # For status checks if you add them later
-  deployments: write # For environment tracking
+  contents: read 
+  actions: write 
+  pull-requests: write 
+  deployments: write 
 
 jobs:
   build:
@@ -47,26 +47,19 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '18'
-          cache: 'npm' # Cache node_modules to speed up builds
+          cache: 'npm' 
 
       - name: Install dependencies
         run: |
-          echo "--- Installing NPM dependencies ---"
           npm ci
-          echo "--- NPM dependencies installed ---"
 
       - name: Run Lint
         run: |
-          echo "--- Running ESLint ---"
           npm run lint
-          echo "--- ESLint finished ---"
 
       - name: Build Next.js Application and Archive
         run: |
-          echo "--- Starting Next.js build ---"
           npm run build
-          echo "--- Next.js build completed successfully. ---"
-          echo "--- Verifying .next directory content ---"
           ls -la .next || { echo ".next directory was not created during build. Build failed?"; exit 1; }
 
           # --- NEW STEP: Archive the .next directory ---
@@ -87,10 +80,10 @@ jobs:
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: frontend-build # Artifact name remains the same
-          path: frontend-build.tar.gz # NOW UPLOAD THE ARCHIVE FILE
+          name: frontend-build 
+          path: frontend-build.tar.gz 
           if-no-files-found: error
-          compression-level: 0 # No need for action to compress already compressed file
+          compression-level: 0 
           overwrite: true
 
   deploy:
@@ -129,7 +122,7 @@ jobs:
           echo "--- Artifact extraction verified and tarball cleaned up ---"
 
       - name: Set deployment variables
-        id: vars # Used to output variables for later steps
+        id: vars 
         run: |
           echo "--- Setting deployment variables based on branch ---"
           if [[ "${{ github.ref }}" == "refs/heads/dev" ]]; then
@@ -172,14 +165,13 @@ jobs:
           echo "${{ steps.vars.outputs.SSH_KEY }}" > key.pem
           chmod 600 key.pem
 
-          # No need to tarball again, the .next folder is now extracted in ./downloaded-build/
-          # We will tar it again for transfer to the server for a clean transfer.
+
           echo "--- Creating tarball of extracted .next for transfer to EC2 ---"
-          # Archive the .next directory from inside downloaded-build
+
           tar -czf next_for_transfer.tar.gz -C ./downloaded-build .next
           echo "--- Tarball for transfer created ---"
 
-          # Transfer the tarball to the EC2 instance
+
           echo "--- Transferring build artifact to EC2 ---"
           scp -o StrictHostKeyChecking=no -i key.pem next_for_transfer.tar.gz ${{ secrets.DEPLOY_USER }}@${{ steps.vars.outputs.SERVER_IP }}:/tmp/next_for_transfer.tar.gz
           echo "--- Artifact transferred ---"
