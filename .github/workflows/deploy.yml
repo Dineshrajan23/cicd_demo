@@ -5,18 +5,40 @@ on:
     branches:
       - dev
       - staging
+      - main 
+  pull_request: # Good practice to lint/test PRs before merging
+    branches:
+      - dev
+      - staging
       - main
   workflow_dispatch:
     inputs:
       rollback_tag:
-        description: 'Git tag to rollback to'
+        description: 'Git tag to rollback to for Production environment'
         required: false
+        type: string
+        default: ''
+      environment:
+        description: 'Target environment for rollback (e.g., dev, staging, production)'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - production
+        default: 'production'
+
+
+permissions:
+  contents: read # Allow checkout
+  actions: write # Allow workflow_dispatch for rollback
+  pull-requests: write # For status checks if you add them later
+  deployments: write # For environment tracking
 
 jobs:
   build:
     name: Build & Test
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -25,36 +47,48 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '18'
+          cache: 'npm' # Cache node_modules to speed up builds
 
       - name: Install dependencies
-        run: npm ci
-        
-      - name: Run Lint
-        run: npm run lint
-
-      - name: Build
         run: |
-            npm run build
-            echo "Build completed successfully."
-            ls -la
-            ls -la .next || echo ".next directory not found!"
-        
+          echo "--- Installing NPM dependencies ---"
+          npm ci
+          echo "--- NPM dependencies installed ---"
 
-    #   - name: Run Tests
-    #     run: npm test
+      - name: Run Lint
+        run: |
+          echo "--- Running ESLint ---"
+          npm run lint
+          echo "--- ESLint finished ---"
+
+      - name: Build Next.js Application
+        run: |
+          echo "--- Starting Next.js build ---"
+          npm run build
+          echo "--- Next.js build completed successfully. ---"
+          echo "--- Verifying .next directory content ---"
+          ls -la .next || { echo ".next directory was not created during build. Build failed?"; exit 1; }
+
+      # - name: Run Tests # Uncomment if you have tests (e.g., Jest, React Testing Library)
+      #   run: |
+      #     echo "--- Running tests ---"
+      #     npm test
+      #     echo "--- Tests completed ---"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: frontend-build
-          path: ${{ github.workspace }}/.next
-          if-no-files-found: error
+          path: ./.next # Path to the built Next.js application
+          if-no-files-found: error # Fail the workflow if .next is not found
+          compression-level: 9 # Max compression
+          overwrite: true # Always overwrite if an artifact with the same name exists
 
   deploy:
-    name: Deploy to Environment
+    name: Deploy to ${{ github.ref == 'refs/heads/main' && 'Production' || (github.ref == 'refs/heads/staging' && 'Staging' || 'Development') }}
     needs: build
     runs-on: ubuntu-latest
-
+    # Manual approval for production
     environment:
       name: ${{ github.ref == 'refs/heads/main' && 'production' || (github.ref == 'refs/heads/staging' && 'staging' || 'development') }}
       url: ${{ github.ref == 'refs/heads/main' && 'https://your-production-url.com' || github.ref == 'refs/heads/staging' && 'https://your-staging-url.com' || 'https://your-dev-url.com' }}
@@ -64,59 +98,126 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: frontend-build
+          path: ./downloaded-build # Download to a specific directory
 
-      - name: Set deploy variables
-        id: vars
+      - name: Verify downloaded artifact
         run: |
-          if [[ "${GITHUB_REF}" == "refs/heads/dev" ]]; then
+          echo "--- Verifying downloaded artifact ---"
+          ls -la ./downloaded-build/.next || { echo "Downloaded .next directory not found!"; exit 1; }
+          echo "--- Artifact verified ---"
+
+      - name: Set deployment variables
+        id: vars # Used to output variables for later steps
+        run: |
+          echo "--- Setting deployment variables based on branch ---"
+          if [[ "${{ github.ref }}" == "refs/heads/dev" ]]; then
             echo "DEPLOY_ENV=dev" >> $GITHUB_OUTPUT
             echo "SERVER_IP=${{ secrets.DEV_SERVER_IP }}" >> $GITHUB_OUTPUT
             echo "SSH_KEY=${{ secrets.DEV_EC2_SSH_KEY }}" >> $GITHUB_OUTPUT
-          elif [[ "${GITHUB_REF}" == "refs/heads/staging" ]]; then
+            echo "APP_DIR=${{ secrets.DEV_APP_DIR }}" >> $GITHUB_OUTPUT # e.g., /var/www/dev-app
+          elif [[ "${{ github.ref }}" == "refs/heads/staging" ]]; then
             echo "DEPLOY_ENV=staging" >> $GITHUB_OUTPUT
             echo "SERVER_IP=${{ secrets.STAGING_SERVER_IP }}" >> $GITHUB_OUTPUT
             echo "SSH_KEY=${{ secrets.STAGING_EC2_SSH_KEY }}" >> $GITHUB_OUTPUT
-          else
-            echo "DEPLOY_ENV=prod" >> $GITHUB_OUTPUT
+            echo "APP_DIR=${{ secrets.STAGING_APP_DIR }}" >> $GITHUB_OUTPUT # e.g., /var/www/staging-app
+          elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            echo "DEPLOY_ENV=production" >> $GITHUB_OUTPUT
             echo "SERVER_IP=${{ secrets.PROD_SERVER_IP }}" >> $GITHUB_OUTPUT
             echo "SSH_KEY=${{ secrets.PROD_EC2_SSH_KEY }}" >> $GITHUB_OUTPUT
+            echo "APP_DIR=${{ secrets.PROD_APP_DIR }}" >> $GITHUB_OUTPUT # e.g., /var/www/your-app
+          else
+            echo "Unknown branch ref: ${{ github.ref }}. Exiting."
+            exit 1
           fi
+          echo "--- Deployment variables set ---"
 
-      - name: Save Git Tag (production only)
+      - name: Save Git Tag for Production (only on main branch)
         if: github.ref == 'refs/heads/main'
         run: |
-          git config user.name "github-actions"
-          git config user.email "ci@github.com"
-          git tag "release-$(date +'%Y%m%d%H%M%S')"
-          git push origin --tags
+          echo "--- Tagging production deployment ---"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          TAG_NAME="prod-release-$(date +'%Y%m%d%H%M%S')-${{ github.sha }}"
+          git tag $TAG_NAME
+          git push origin $TAG_NAME
+          echo "--- Production deployment tagged: $TAG_NAME ---"
+          # Store the tag name for potential use in deployment status/monitoring
+          echo "PROD_DEPLOY_TAG=$TAG_NAME" >> $GITHUB_OUTPUT # Not used directly in this workflow, but useful
 
-      - name: Deploy to EC2
+      - name: Deploy to EC2 via SCP and SSH
         run: |
+          echo "--- Starting deployment to EC2 instance: ${{ steps.vars.outputs.SERVER_IP }} ---"
+          # Save SSH key temporarily
           echo "${{ steps.vars.outputs.SSH_KEY }}" > key.pem
           chmod 600 key.pem
 
-          ssh -o StrictHostKeyChecking=no -i key.pem ${{ secrets.DEPLOY_USER }}@${{ steps.vars.outputs.SERVER_IP }} << 'EOF'
-            TIMESTAMP=$(date +'%Y%m%d%H%M%S')
-            BACKUP_DIR=~/backup/frontend-$TIMESTAMP
-            mkdir -p "$BACKUP_DIR"
-            cp -r /var/www/your-app/.next "$BACKUP_DIR" 2>/dev/null || echo ".next folder not found, skipping backup"
+          # Create a compressed tarball of the built .next directory
+          echo "--- Creating tarball of build artifact ---"
+          tar -czf next_build.tar.gz -C ./downloaded-build .next
+          echo "--- Tarball created ---"
 
-            cd /var/www/your-app
-            git pull origin ${{ steps.vars.outputs.DEPLOY_ENV }}
-            npm install
-            npm run build
-            pm2 restart your-app || npm run start &
+          # Transfer the tarball to the EC2 instance
+          echo "--- Transferring build artifact to EC2 ---"
+          scp -o StrictHostKeyChecking=no -i key.pem next_build.tar.gz ${{ secrets.DEPLOY_USER }}@${{ steps.vars.outputs.SERVER_IP }}:/tmp/next_build.tar.gz
+          echo "--- Artifact transferred ---"
+
+          # SSH into the EC2 instance and perform deployment steps
+          echo "--- Executing deployment commands on EC2 ---"
+          ssh -o StrictHostKeyChecking=no -i key.pem ${{ secrets.DEPLOY_USER }}@${{ steps.vars.outputs.SERVER_IP }} << EOF
+            # Define variables on the server side
+            APP_DIR="${{ steps.vars.outputs.APP_DIR }}" # e.g., /var/www/your-app
+            TIMESTAMP=\$(date +'%Y%m%d%H%M%S')
+            BACKUP_DIR="\$HOME/backups/\${APP_DIR//\//_}-production-\$TIMESTAMP" # Adjust path as needed
+            BUILD_TARBALL="/tmp/next_build.tar.gz"
+
+            echo "Server: Starting deployment for \${APP_DIR}"
+
+            # 1. Create backup of the current deployment (if it exists)
+            if [ -d "\$APP_DIR" ]; then
+                echo "Server: Creating backup of current deployment to \$BACKUP_DIR"
+                mkdir -p "\$BACKUP_DIR"
+                # Only backup .next, node_modules (if present and managed on server), and relevant configs
+                # This assumes your app is structured with .next inside APP_DIR
+                cp -r "\$APP_DIR/.next" "\$BACKUP_DIR/" 2>/dev/null || echo "Server: .next folder not found in current deployment, skipping .next backup."
+                # Add other files to backup if needed, e.g., package.json, next.config.ts, public
+                cp "\$APP_DIR/package.json" "\$BACKUP_DIR/" 2>/dev/null || echo "Server: package.json not found, skipping backup."
+                cp "\$APP_DIR/next.config.ts" "\$BACKUP_DIR/" 2>/dev/null || echo "Server: next.config.ts not found, skipping backup."
+                cp -r "\$APP_DIR/public" "\$BACKUP_DIR/" 2>/dev/null || echo "Server: public folder not found, skipping backup."
+                echo "Server: Backup completed."
+            else
+                echo "Server: Application directory \$APP_DIR does not exist. Skipping backup."
+                mkdir -p "\$APP_DIR" # Ensure target directory exists for first deployment
+            fi
+
+            # 2. Extract the new build artifact
+            echo "Server: Extracting new build artifact from \$BUILD_TARBALL to \$APP_DIR"
+            # Remove existing .next folder before extracting new one to ensure clean deployment
+            rm -rf "\$APP_DIR/.next"
+            tar -xzf "\$BUILD_TARBALL" -C "\$APP_DIR" # Extract directly into APP_DIR
+
+            # 3. Clean up the tarball
+            echo "Server: Cleaning up build tarball"
+            rm "\$BUILD_TARBALL"
+
+            # 4. Restart the application (e.g., using PM2 or systemd)
+            echo "Server: Restarting application 'your-app' via PM2..."
+            # Adjust 'your-app' to the actual PM2 process name/ID
+            pm2 restart your-app || (echo "Server: PM2 process 'your-app' not found or failed to restart. Attempting to start as new process." && pm2 start --name your-app "npm run start" --cwd "\$APP_DIR") || echo "Server: Failed to manage PM2 process. Manual intervention may be required."
+
+            echo "Server: Deployment process completed."
           EOF
-
+          echo "--- Deployment to EC2 finished ---"
+          # Clean up temporary SSH key
+          rm key.pem
 
   rollback:
     name: Rollback Deployment
-    if: github.event.inputs.rollback_tag != ''
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.rollback_tag != ''
     runs-on: ubuntu-latest
-    needs: build
+    needs: build 
 
     steps:
-      - name: Checkout tag
+      - name: Checkout specified tag for rollback
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.rollback_tag }}
@@ -125,21 +226,79 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '18'
+          cache: 'npm'
 
-      - name: Install & Build for Rollback
+      - name: Install dependencies for rollback build
         run: |
+          echo "--- Installing dependencies for rollback build ---"
           npm ci
-          npm run build
+          echo "--- Dependencies installed ---"
 
-      - name: Deploy Rollback Build to Production
+      - name: Build application for rollback
         run: |
-          echo "${{ secrets.PROD_EC2_SSH_KEY }}" > key.pem
+          echo "--- Building application for rollback from tag: ${{ github.event.inputs.rollback_tag }} ---"
+          npm run build
+          echo "--- Rollback build completed ---"
+          ls -la .next || { echo ".next directory was not created during rollback build. Build failed?"; exit 1; }
+
+      - name: Set rollback deployment variables
+        id: vars
+        run: |
+          echo "--- Setting rollback variables for environment: ${{ github.event.inputs.environment }} ---"
+          if [[ "${{ github.event.inputs.environment }}" == "dev" ]]; then
+            echo "SERVER_IP=${{ secrets.DEV_SERVER_IP }}" >> $GITHUB_OUTPUT
+            echo "SSH_KEY=${{ secrets.DEV_EC2_SSH_KEY }}" >> $GITHUB_OUTPUT
+            echo "APP_DIR=${{ secrets.DEV_APP_DIR }}" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.event.inputs.environment }}" == "staging" ]]; then
+            echo "SERVER_IP=${{ secrets.STAGING_SERVER_IP }}" >> $GITHUB_OUTPUT
+            echo "SSH_KEY=${{ secrets.STAGING_EC2_SSH_KEY }}" >> $GITHUB_OUTPUT
+            echo "APP_DIR=${{ secrets.STAGING_APP_DIR }}" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.event.inputs.environment }}" == "production" ]]; then
+            echo "SERVER_IP=${{ secrets.PROD_SERVER_IP }}" >> $GITHUB_OUTPUT
+            echo "SSH_KEY=${{ secrets.PROD_EC2_SSH_KEY }}" >> $GITHUB_OUTPUT
+            echo "APP_DIR=${{ secrets.PROD_APP_DIR }}" >> $GITHUB_OUTPUT
+          else
+            echo "Invalid environment for rollback: ${{ github.event.inputs.environment }}. Exiting."
+            exit 1
+          fi
+          echo "--- Rollback variables set ---"
+
+      - name: Perform Rollback Deployment to EC2
+        run: |
+          echo "--- Starting rollback deployment to EC2 instance: ${{ steps.vars.outputs.SERVER_IP }} ---"
+          echo "${{ steps.vars.outputs.SSH_KEY }}" > key.pem
           chmod 600 key.pem
 
-          ssh -o StrictHostKeyChecking=no -i key.pem ${{ secrets.DEPLOY_USER }}@${{ secrets.PROD_SERVER_IP }} << 'EOF'
-            cd /var/www/your-app
-            git reset --hard ${{ github.event.inputs.rollback_tag }}
-            npm install
-            npm run build
-            pm2 restart your-app || npm run start &
+          echo "--- Creating tarball of rollback build artifact ---"
+          tar -czf next_rollback_build.tar.gz ./.next
+          echo "--- Tarball created ---"
+
+          echo "--- Transferring rollback build artifact to EC2 ---"
+          scp -o StrictHostKeyChecking=no -i key.pem next_rollback_build.tar.gz ${{ secrets.DEPLOY_USER }}@${{ steps.vars.outputs.SERVER_IP }}:/tmp/next_rollback_build.tar.gz
+          echo "--- Artifact transferred ---"
+
+          echo "--- Executing rollback commands on EC2 ---"
+          ssh -o StrictHostKeyChecking=no -i key.pem ${{ secrets.DEPLOY_USER }}@${{ steps.vars.outputs.SERVER_IP }} << EOF
+            APP_DIR="${{ steps.vars.outputs.APP_DIR }}"
+            BUILD_TARBALL="/tmp/next_rollback_build.tar.gz"
+
+            echo "Server: Starting rollback for \${APP_DIR} to tag: ${{ github.event.inputs.rollback_tag }}"
+
+            # No backup during rollback, as we are already restoring a known good state.
+            # If you want to backup the current (potentially broken) state before rollback,
+            # you can add similar backup logic here as in the deploy job.
+
+            echo "Server: Extracting rollback build artifact from \$BUILD_TARBALL to \$APP_DIR"
+            rm -rf "\$APP_DIR/.next" # Remove current (potentially problematic) .next
+            tar -xzf "\$BUILD_TARBALL" -C "\$APP_DIR" # Extract rollback .next
+
+            echo "Server: Cleaning up rollback tarball"
+            rm "\$BUILD_TARBALL"
+
+            echo "Server: Restarting application 'your-app' via PM2..."
+            pm2 restart your-app || (echo "Server: PM2 process 'your-app' not found. Attempting to start." && pm2 start --name your-app "npm run start" --cwd "\$APP_DIR") || echo "Server: Failed to manage PM2 process during rollback."
+
+            echo "Server: Rollback process completed."
           EOF
+          echo "--- Rollback to EC2 finished ---"
+          rm key.pem
