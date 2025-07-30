@@ -36,7 +36,8 @@ jobs:
         run: |
             npm run build
             echo "Build completed successfully."
-            ls -la .next
+            ls -la
+            ls -la .next || echo ".next directory not found!"
         
 
     #   - name: Run Tests
@@ -47,6 +48,7 @@ jobs:
         with:
           name: frontend-build
           path: .next
+          if-no-files-found: error
 
   deploy:
     name: Deploy to Environment
