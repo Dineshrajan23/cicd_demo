@@ -107,13 +107,26 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: frontend-build
-          path: . # Download to a specific directory
+          path: ./downloaded-build
 
-      - name: Verify downloaded artifact
+      - name: Extract downloaded artifact
         run: |
-          echo "--- Verifying downloaded artifact ---"
-          ls -la ./downloaded-build/.next || { echo "Downloaded .next directory not found!"; exit 1; }
-          echo "--- Artifact verified ---"
+          echo "--- Extracting downloaded build artifact ---"
+          # Verify the tarball exists within the downloaded-build directory
+          ls -la ./downloaded-build/frontend-build.tar.gz || { echo "Downloaded artifact (frontend-build.tar.gz) not found in ./downloaded-build!"; exit 1; }
+
+          # Extract the tarball. The -C flag tells tar to change directory before extracting.
+          # The .next directory was archived from the root of the build context,
+          # so extracting it will put it directly into ./downloaded-build/.next
+          tar -xzf ./downloaded-build/frontend-build.tar.gz -C ./downloaded-build/
+          echo "--- Artifact extracted. Listing contents of ./downloaded-build: ---"
+          ls -la ./downloaded-build/ # Verify the .next directory is now there
+          echo "--- Verifying extracted .next directory: ---"
+          ls -la ./downloaded-build/.next || { echo "Extracted .next directory not found in ./downloaded-build!"; exit 1; }
+          
+          # Optional: Clean up the tarball after extraction on the runner
+          rm ./downloaded-build/frontend-build.tar.gz
+          echo "--- Artifact extraction verified and tarball cleaned up ---"
 
       - name: Set deployment variables
         id: vars # Used to output variables for later steps
@@ -159,11 +172,11 @@ jobs:
           echo "${{ steps.vars.outputs.SSH_KEY }}" > key.pem
           chmod 600 key.pem
 
-          # No need to tarball again, we already have the .next folder extracted in the current directory
-          # The scp will transfer the extracted .next folder (or we can re-tar it for transfer)
-          # Let's re-tar it for transfer for consistency with the server-side extraction
-          echo "--- Re-creating tarball of .next for transfer to EC2 ---"
-          tar -czf next_for_transfer.tar.gz .next
+          # No need to tarball again, the .next folder is now extracted in ./downloaded-build/
+          # We will tar it again for transfer to the server for a clean transfer.
+          echo "--- Creating tarball of extracted .next for transfer to EC2 ---"
+          # Archive the .next directory from inside downloaded-build
+          tar -czf next_for_transfer.tar.gz -C ./downloaded-build .next
           echo "--- Tarball for transfer created ---"
 
           # Transfer the tarball to the EC2 instance
@@ -172,12 +185,11 @@ jobs:
           echo "--- Artifact transferred ---"
 
           # SSH into the EC2 instance and perform deployment steps
-          echo "--- Executing deployment commands on EC2 ---"
           ssh -o StrictHostKeyChecking=no -i key.pem ${{ secrets.DEPLOY_USER }}@${{ steps.vars.outputs.SERVER_IP }} << 'EOF'
             APP_DIR="${{ steps.vars.outputs.APP_DIR }}"
             TIMESTAMP=$(date +'%Y%m%d%H%M%S')
             BACKUP_DIR="$HOME/backups/${APP_DIR##*/}-backup-$TIMESTAMP"
-            BUILD_TARBALL="/tmp/next_for_transfer.tar.gz" # Use the new tarball name
+            BUILD_TARBALL="/tmp/next_for_transfer.tar.gz"
 
             echo "Server: Starting deployment for application in \$APP_DIR"
 
@@ -211,7 +223,7 @@ jobs:
           EOF
           echo "--- Deployment to EC2 finished ---"
           rm key.pem
-          rm next_for_transfer.tar.gz
+          rm next_for_transfer.tar.gz # Clean up the tarball on the runner
 
   rollback:
     name: Rollback Deployment
