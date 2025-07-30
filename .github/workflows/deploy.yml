@@ -47,7 +47,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: frontend-build
-          path: ./.next
+          path: ${{ github.workspace }}/.next
           if-no-files-found: error
 
   deploy:
