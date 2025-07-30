@@ -28,6 +28,7 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+        working-directory: ./frontend
 
       - name: Run Lint
         run: npm run lint
@@ -37,6 +38,7 @@ jobs:
             npm run build
             echo "Build completed successfully."
             ls -la .next
+        working-directory: ./frontend
 
     #   - name: Run Tests
     #     run: npm test
@@ -45,7 +47,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: frontend-build
-          path: .next
+          path: frontend/.next
 
   deploy:
     name: Deploy to Environment
