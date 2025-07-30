@@ -61,13 +61,22 @@ jobs:
           npm run lint
           echo "--- ESLint finished ---"
 
-      - name: Build Next.js Application
+      - name: Build Next.js Application and Archive
         run: |
           echo "--- Starting Next.js build ---"
           npm run build
           echo "--- Next.js build completed successfully. ---"
           echo "--- Verifying .next directory content ---"
           ls -la .next || { echo ".next directory was not created during build. Build failed?"; exit 1; }
+
+          # --- NEW STEP: Archive the .next directory ---
+          echo "--- Archiving .next directory to frontend-build.tar.gz ---"
+          # Ensure you are in the correct directory. 'tar -C' changes directory before archiving.
+          # We want to archive the .next directory, relative to the current working directory.
+          tar -czf frontend-build.tar.gz .next/
+          echo "--- Archive created successfully. Listing archive details: ---"
+          ls -lh frontend-build.tar.gz || { echo "Failed to create archive!"; exit 1; }
+          # --- END NEW STEP ---
 
       # - name: Run Tests # Uncomment if you have tests (e.g., Jest, React Testing Library)
       #   run: |
@@ -78,11 +87,11 @@ jobs:
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: frontend-build
-          path: .next/
-          if-no-files-found: error # Fail the workflow if .next is not found
-          compression-level: 9 # Max compression
-          overwrite: true # Always overwrite if an artifact with the same name exists
+          name: frontend-build # Artifact name remains the same
+          path: frontend-build.tar.gz # NOW UPLOAD THE ARCHIVE FILE
+          if-no-files-found: error
+          compression-level: 0 # No need for action to compress already compressed file
+          overwrite: true
 
   deploy:
     name: Deploy to ${{ github.ref == 'refs/heads/main' && 'Production' || (github.ref == 'refs/heads/staging' && 'Staging' || 'Development') }}
@@ -98,7 +107,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: frontend-build
-          path: ./downloaded-build # Download to a specific directory
+          path: . # Download to a specific directory
 
       - name: Verify downloaded artifact
         run: |
@@ -147,68 +156,62 @@ jobs:
       - name: Deploy to EC2 via SCP and SSH
         run: |
           echo "--- Starting deployment to EC2 instance: ${{ steps.vars.outputs.SERVER_IP }} ---"
-          # Save SSH key temporarily
           echo "${{ steps.vars.outputs.SSH_KEY }}" > key.pem
           chmod 600 key.pem
 
-          # Create a compressed tarball of the built .next directory
-          echo "--- Creating tarball of build artifact ---"
-          tar -czf next_build.tar.gz -C ./downloaded-build .next
-          echo "--- Tarball created ---"
+          # No need to tarball again, we already have the .next folder extracted in the current directory
+          # The scp will transfer the extracted .next folder (or we can re-tar it for transfer)
+          # Let's re-tar it for transfer for consistency with the server-side extraction
+          echo "--- Re-creating tarball of .next for transfer to EC2 ---"
+          tar -czf next_for_transfer.tar.gz .next
+          echo "--- Tarball for transfer created ---"
 
           # Transfer the tarball to the EC2 instance
           echo "--- Transferring build artifact to EC2 ---"
-          scp -o StrictHostKeyChecking=no -i key.pem next_build.tar.gz ${{ secrets.DEPLOY_USER }}@${{ steps.vars.outputs.SERVER_IP }}:/tmp/next_build.tar.gz
+          scp -o StrictHostKeyChecking=no -i key.pem next_for_transfer.tar.gz ${{ secrets.DEPLOY_USER }}@${{ steps.vars.outputs.SERVER_IP }}:/tmp/next_for_transfer.tar.gz
           echo "--- Artifact transferred ---"
 
           # SSH into the EC2 instance and perform deployment steps
           echo "--- Executing deployment commands on EC2 ---"
-          ssh -o StrictHostKeyChecking=no -i key.pem ${{ secrets.DEPLOY_USER }}@${{ steps.vars.outputs.SERVER_IP }} << EOF
-            # Define variables on the server side
-            APP_DIR="${{ steps.vars.outputs.APP_DIR }}" # e.g., /var/www/your-app
-            TIMESTAMP=\$(date +'%Y%m%d%H%M%S')
-            BACKUP_DIR="\$HOME/backups/\${APP_DIR//\//_}-production-\$TIMESTAMP" # Adjust path as needed
-            BUILD_TARBALL="/tmp/next_build.tar.gz"
+          ssh -o StrictHostKeyChecking=no -i key.pem ${{ secrets.DEPLOY_USER }}@${{ steps.vars.outputs.SERVER_IP }} << 'EOF'
+            APP_DIR="${{ steps.vars.outputs.APP_DIR }}"
+            TIMESTAMP=$(date +'%Y%m%d%H%M%S')
+            BACKUP_DIR="$HOME/backups/${APP_DIR##*/}-backup-$TIMESTAMP"
+            BUILD_TARBALL="/tmp/next_for_transfer.tar.gz" # Use the new tarball name
 
-            echo "Server: Starting deployment for \${APP_DIR}"
+            echo "Server: Starting deployment for application in \$APP_DIR"
 
-            # 1. Create backup of the current deployment (if it exists)
             if [ -d "\$APP_DIR" ]; then
-                echo "Server: Creating backup of current deployment to \$BACKUP_DIR"
+                echo "Server: Current application directory found. Creating backup to \$BACKUP_DIR"
                 mkdir -p "\$BACKUP_DIR"
-                # Only backup .next, node_modules (if present and managed on server), and relevant configs
-                # This assumes your app is structured with .next inside APP_DIR
                 cp -r "\$APP_DIR/.next" "\$BACKUP_DIR/" 2>/dev/null || echo "Server: .next folder not found in current deployment, skipping .next backup."
-                # Add other files to backup if needed, e.g., package.json, next.config.ts, public
                 cp "\$APP_DIR/package.json" "\$BACKUP_DIR/" 2>/dev/null || echo "Server: package.json not found, skipping backup."
                 cp "\$APP_DIR/next.config.ts" "\$BACKUP_DIR/" 2>/dev/null || echo "Server: next.config.ts not found, skipping backup."
                 cp -r "\$APP_DIR/public" "\$BACKUP_DIR/" 2>/dev/null || echo "Server: public folder not found, skipping backup."
                 echo "Server: Backup completed."
             else
-                echo "Server: Application directory \$APP_DIR does not exist. Skipping backup."
-                mkdir -p "\$APP_DIR" # Ensure target directory exists for first deployment
+                echo "Server: Application directory \$APP_DIR does not exist. Creating it."
+                mkdir -p "\$APP_DIR"
             fi
 
-            # 2. Extract the new build artifact
-            echo "Server: Extracting new build artifact from \$BUILD_TARBALL to \$APP_DIR"
-            # Remove existing .next folder before extracting new one to ensure clean deployment
+            echo "Server: Removing old .next folder and extracting new build from \$BUILD_TARBALL"
             rm -rf "\$APP_DIR/.next"
-            tar -xzf "\$BUILD_TARBALL" -C "\$APP_DIR" # Extract directly into APP_DIR
+            tar -xzf "\$BUILD_TARBALL" -C "\$APP_DIR"
 
-            # 3. Clean up the tarball
-            echo "Server: Cleaning up build tarball"
+            echo "Server: Cleaning up build tarball: \$BUILD_TARBALL"
             rm "\$BUILD_TARBALL"
 
-            # 4. Restart the application (e.g., using PM2 or systemd)
-            echo "Server: Restarting application 'your-app' via PM2..."
-            # Adjust 'your-app' to the actual PM2 process name/ID
-            pm2 restart your-app || (echo "Server: PM2 process 'your-app' not found or failed to restart. Attempting to start as new process." && pm2 start --name your-app "npm run start" --cwd "\$APP_DIR") || echo "Server: Failed to manage PM2 process. Manual intervention may be required."
+            echo "Server: Attempting to restart PM2 process 'your-app'..."
+            pm2 restart your-app || \
+            (echo "Server: PM2 process 'your-app' not found or failed to restart. Attempting to start as new process." && \
+             pm2 start npm --name your-app -- run start --cwd "\$APP_DIR") || \
+             echo "Server: Failed to manage PM2 process. Manual intervention may be required."
 
-            echo "Server: Deployment process completed."
+            echo "Server: Deployment process completed successfully for \${APP_DIR}."
           EOF
           echo "--- Deployment to EC2 finished ---"
-          # Clean up temporary SSH key
           rm key.pem
+          rm next_for_transfer.tar.gz
 
   rollback:
     name: Rollback Deployment
