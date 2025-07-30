@@ -309,3 +309,5 @@ jobs:
           EOF
           echo "--- Rollback to EC2 finished ---"
           rm key.pem
+
+          echo "--completed Rollback Deployment---"
