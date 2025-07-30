@@ -93,14 +93,18 @@ jobs:
           chmod 600 key.pem
 
           ssh -o StrictHostKeyChecking=no -i key.pem ${{ secrets.DEPLOY_USER }}@${{ steps.vars.outputs.SERVER_IP }} << 'EOF'
-            mkdir -p ~/backup/frontend-$(date +'%Y%m%d%H%M%S')
-            cp -r /var/www/your-app/.next ~/backup/frontend-$(date +'%Y%m%d%H%M%S')
+            TIMESTAMP=$(date +'%Y%m%d%H%M%S')
+            BACKUP_DIR=~/backup/frontend-$TIMESTAMP
+            mkdir -p "$BACKUP_DIR"
+            cp -r /var/www/your-app/.next "$BACKUP_DIR" 2>/dev/null || echo ".next folder not found, skipping backup"
+
             cd /var/www/your-app
             git pull origin ${{ steps.vars.outputs.DEPLOY_ENV }}
             npm install
             npm run build
             pm2 restart your-app || npm run start &
           EOF
+
 
   rollback:
     name: Rollback Deployment
