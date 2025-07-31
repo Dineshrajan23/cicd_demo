@@ -13,8 +13,8 @@ on:
       - production
   workflow_dispatch:
     inputs:
-      rollback_tag:
-        description: 'Git tag to rollback to for Production environment'
+      rollback_image_tag: 
+        description: 'Docker Image Tag to rollback to (e.g., commit SHA or "latest")'
         required: false
         type: string
         default: ''
@@ -38,16 +38,22 @@ jobs:
   build_and_push_docker_image:
     name: Build & Push Docker Image
     runs-on: ubuntu-latest
+    outputs:
+      ecr_uri: ${{ steps.image_vars.outputs.ECR_URI }}
+      image_tag: ${{ steps.image_vars.outputs.IMAGE_TAG }}
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v3
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ap-south-1 
+          aws-region: ap-south-1 #need to update with the actual region
 
       - name: Login to Amazon ECR
         id: login-ecr
@@ -56,32 +62,37 @@ jobs:
       - name: Set Image Tag and ECR URI
         id: image_vars
         run: |
-          # Use SHA as tag for unique identification, useful for rollback/history
-          IMAGE_TAG="${{ github.sha }}"
+          echo "--- Setting Image Tag and ECR URI ---"
+          IMAGE_TAG="${{ github.sha }}" # Unique tag based on commit SHA
           ECR_URI="${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY_NAME }}"
-          echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_OUTPUT
           echo "ECR_URI=$ECR_URI" >> $GITHUB_OUTPUT
-          echo "Building image: $ECR_URI:$IMAGE_TAG"
+          echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "--- Image Tag: $IMAGE_TAG, ECR URI: $ECR_URI ---"
 
       - name: Build and push Docker image to ECR
         run: |
+          echo "--- Building Docker image ---"
           docker build -t ${{ steps.image_vars.outputs.ECR_URI }}:${{ steps.image_vars.outputs.IMAGE_TAG }} .
-          docker push ${{ steps.image_vars.outputs.ECR_URI }}:${{ steps.image_vars.outputs.IMAGE_TAG }}
+          echo "--- Docker image built ---"
 
-          # For 'latest' tag, only push on main branch
+          echo "--- Pushing Docker image to ECR with SHA tag ---"
+          docker push ${{ steps.image_vars.outputs.ECR_URI }}:${{ steps.image_vars.outputs.IMAGE_TAG }}
+          echo "--- Docker image pushed with SHA tag ---"
+
           if [[ "${{ github.ref }}" == "refs/heads/production" ]]; then
-            docker tag ${{ steps.image_vars.outputs.ECR_URI }}:${{ steps.image_vars.outputs.IMAGE_TAG }} ${{ steps.image_vars.outputs.ECR_URI }}:latest
+            echo "--- Tagging and pushing 'latest' for production branch (production) ---"
+            docker tag ${{ steps.image_vars.outputs.ECR_URI }}:${{ steps.image_vars.outputs.IMAGE_TAG }} ${{ steps.image_vars.outputs.ECR_URI}}:latest
             docker push ${{ steps.image_vars.outputs.ECR_URI }}:latest
-            echo "Pushed latest tag for production."
+            echo "--- 'latest' tag pushed ---"
           fi
 
   deploy:
-    name: Deploy Docker Image to ${{ github.ref == 'refs/heads/production' && 'Production' || (github.ref == 'refs/heads/staging' && 'Staging' || 'Development') }}
-    needs: build_and_push_docker_image 
+    name: Deploy to ${{ github.ref == 'refs/heads/production' && 'Production' || (github.ref == 'refs/heads/staging' && 'Staging' || 'Development') }}
+    needs: build_and_push_docker_image
     runs-on: ubuntu-latest
-    environment:
+    environment: 
       name: ${{ github.ref == 'refs/heads/production' && 'production' || (github.ref == 'refs/heads/staging' && 'staging' || 'development') }}
-      url: ${{ github.ref == 'refs/heads/production' && 'https://production-url.com' || github.ref == 'refs/heads/staging' && 'https://staging-url.com' || 'https://dev-url.com' }} 
+      url: ${{ github.ref == 'refs/heads/production' && 'https://your-production-url.com' || github.ref == 'refs/heads/staging' && 'https://your-staging-url.com' || 'https://your-dev-url.com' }} # Update with your actual URLs
 
     steps:
       - name: Set deployment variables
@@ -91,63 +102,166 @@ jobs:
           if [[ "${{ github.ref }}" == "refs/heads/dev" ]]; then
             echo "SERVER_IP=${{ secrets.DEV_SERVER_IP }}" >> $GITHUB_OUTPUT
             echo "SSH_KEY=${{ secrets.DEV_EC2_SSH_KEY }}" >> $GITHUB_OUTPUT
-            echo "CONTAINER_NAME=nextjs-dev" >> $GITHUB_OUTPUT # Unique name for container
-            echo "APP_PORT=3000" >> $GITHUB_OUTPUT # Internal app port
-            echo "HOST_PORT=3000" >> $GITHUB_OUTPUT # Host port to map
+            echo "CONTAINER_NAME=nextjs-dev" >> $GITHUB_OUTPUT
+            echo "HOST_PORT=3000" >> $GITHUB_OUTPUT
           elif [[ "${{ github.ref }}" == "refs/heads/staging" ]]; then
             echo "SERVER_IP=${{ secrets.STAGING_SERVER_IP }}" >> $GITHUB_OUTPUT
             echo "SSH_KEY=${{ secrets.STAGING_EC2_SSH_KEY }}" >> $GITHUB_OUTPUT
             echo "CONTAINER_NAME=nextjs-staging" >> $GITHUB_OUTPUT
-            echo "APP_PORT=3000" >> $GITHUB_OUTPUT
             echo "HOST_PORT=3000" >> $GITHUB_OUTPUT
           elif [[ "${{ github.ref }}" == "refs/heads/production" ]]; then
             echo "SERVER_IP=${{ secrets.PROD_SERVER_IP }}" >> $GITHUB_OUTPUT
             echo "SSH_KEY=${{ secrets.PROD_EC2_SSH_KEY }}" >> $GITHUB_OUTPUT
             echo "CONTAINER_NAME=nextjs-prod" >> $GITHUB_OUTPUT
-            echo "APP_PORT=3000" >> $GITHUB_OUTPUT
-            echo "HOST_PORT=80" >> $GITHUB_OUTPUT # Production usually uses port 80/443
+            echo "HOST_PORT=80" >> $GITHUB_OUTPUT # Typically 80/443 for production
           else
             echo "Unknown branch ref: ${{ github.ref }}. Exiting."
             exit 1
           fi
-          # Get image URI and tag from the build_and_push_docker_image job's outputs
-          echo "ECR_URI=${{ needs.build_and_push_docker_image.outputs.ECR_URI }}" >> $GITHUB_OUTPUT
-          echo "IMAGE_TAG=${{ needs.build_and_push_docker_image.outputs.IMAGE_TAG }}" >> $GITHUB_OUTPUT
+
+          echo "ECR_URI=${{ needs.build_and_push_docker_image.outputs.ecr_uri }}" >> $GITHUB_OUTPUT
+          echo "IMAGE_TAG=${{ needs.build_and_push_docker_image.outputs.image_tag }}" >> $GITHUB_OUTPUT
+          echo "APP_PORT=3000" >> $GITHUB_OUTPUT # Internal port of the Next.js app inside Docker
           echo "--- Deployment variables set ---"
+
+      - name: Install SSH Key
+        run: |
+          echo "--- Installing SSH Key for EC2 connection ---"
+          echo "${{ steps.vars.outputs.SSH_KEY }}" > key.pem
+          chmod 600 key.pem
+          echo "--- SSH Key installed ---"
 
       - name: Deploy Docker container to EC2 via SSH
         run: |
           echo "--- Starting Docker deployment to EC2 instance: ${{ steps.vars.outputs.SERVER_IP }} ---"
-          echo "${{ steps.vars.outputs.SSH_KEY }}" > key.pem
-          chmod 600 key.pem
-
+          
           IMAGE_TO_DEPLOY="${{ steps.vars.outputs.ECR_URI }}:${{ steps.vars.outputs.IMAGE_TAG }}"
           CONTAINER_NAME="${{ steps.vars.outputs.CONTAINER_NAME }}"
           HOST_PORT="${{ steps.vars.outputs.HOST_PORT }}"
           APP_PORT="${{ steps.vars.outputs.APP_PORT }}"
+          
+          ssh -o StrictHostKeyChecking=no -i key.pem ${{ secrets.DEPLOY_USER }}@${{ steps.vars.outputs.SERVER_IP }} << 'EOF'
+            echo "Server: Pulling Docker image: ${IMAGE_TO_DEPLOY}"
+            docker pull "${IMAGE_TO_DEPLOY}"
+            echo "Server: Docker image pulled."
 
-          ssh -o StrictHostKeyChecking=no -i key.pem ${{ secrets.DEPLOY_USER }}@${{ steps.vars.outputs.SERVER_IP }} << EOF
-            echo "Server: Pulling Docker image: \${IMAGE_TO_DEPLOY}"
-            docker pull "\${IMAGE_TO_DEPLOY}"
+            echo "Server: Stopping and removing old container (if exists): ${CONTAINER_NAME}"
+            docker stop "${CONTAINER_NAME}" || true
+            docker rm "${CONTAINER_NAME}" || true
+            echo "Server: Old container stopped and removed."
 
-            echo "Server: Stopping and removing old container (if exists): \${CONTAINER_NAME}"
-            docker stop "\${CONTAINER_NAME}" || true
-            docker rm "\${CONTAINER_NAME}" || true
-
-            echo "Server: Running new container: \${CONTAINER_NAME} on port \${HOST_PORT}:\${APP_PORT}"
-            # Run the new container, mapping host port to container port
-            # Add any necessary environment variables for your app here using -e
+            echo "Server: Running new container: ${CONTAINER_NAME} on port ${HOST_PORT}:${APP_PORT}"
+            # IMPORTANT: Add any environment variables your Next.js app needs here for runtime
             docker run -d \
-              --name "\${CONTAINER_NAME}" \
-              -p "\${HOST_PORT}":"\${APP_PORT}" \
+              --name "${CONTAINER_NAME}" \
+              -p "${HOST_PORT}":"${APP_PORT}" \
               -e "NODE_ENV=production" \
-              -e "NEXT_PUBLIC_API_URL=https://api-url.com" \ 
-              "\${IMAGE_TO_DEPLOY}"
+              -e "NEXT_PUBLIC_API_URL=https://your-backend-api.com" \ # EXAMPLE ENV VAR
+              "${IMAGE_TO_DEPLOY}"
+            echo "Server: New container started."
 
-            echo "Server: Cleaning up old Docker images to free space"
+            echo "Server: Cleaning up old Docker images to free space."
             docker image prune -f
+            echo "Server: Old Docker images pruned."
 
             echo "Server: Docker deployment process completed successfully."
           EOF
           echo "--- Docker deployment to EC2 finished ---"
-          rm key.pem
+          rm key.pem # Clean up SSH key from runner
+
+  rollback:
+    name: Rollback Deployment
+    # Only run if manual workflow_dispatch AND a rollback_image_tag is provided
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.rollback_image_tag != ''
+    runs-on: ubuntu-latest
+    needs: build_and_push_docker_image 
+
+    steps:
+      - name: Configure AWS credentials for rollback
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-south-1 #here the region need to update
+
+      - name: Login to Amazon ECR for rollback
+        id: login-ecr-rollback
+        uses: aws-actions/amazon-ecr-login@v2 
+
+      - name: Set rollback deployment variables
+        id: vars
+        run: |
+          echo "--- Setting rollback variables for environment: ${{ github.event.inputs.environment }} ---"
+          ECR_URI="${{ steps.login-ecr-rollback.outputs.registry }}/${{ secrets.ECR_REPOSITORY_NAME }}"
+          echo "ECR_URI=$ECR_OUTPUT" >> $GITHUB_OUTPUT # Corrected variable name here
+          echo "ROLLBACK_IMAGE_TAG=${{ github.event.inputs.rollback_image_tag }}" >> $GITHUB_OUTPUT
+
+          if [[ "${{ github.event.inputs.environment }}" == "dev" ]]; then
+            echo "SERVER_IP=${{ secrets.DEV_SERVER_IP }}" >> $GITHUB_OUTPUT
+            echo "SSH_KEY=${{ secrets.DEV_EC2_SSH_KEY }}" >> $GITHUB_OUTPUT
+            echo "CONTAINER_NAME=nextjs-dev" >> $GITHUB_OUTPUT
+            echo "HOST_PORT=3000" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.event.inputs.environment }}" == "staging" ]]; then
+            echo "SERVER_IP=${{ secrets.STAGING_SERVER_IP }}" >> $GITHUB_OUTPUT
+            echo "SSH_KEY=${{ secrets.STAGING_EC2_SSH_KEY }}" >> $GITHUB_OUTPUT
+            echo "CONTAINER_NAME=nextjs-staging" >> $GITHUB_OUTPUT
+            echo "HOST_PORT=3000" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.event.inputs.environment }}" == "production" ]]; then
+            echo "SERVER_IP=${{ secrets.PROD_SERVER_IP }}" >> $GITHUB_OUTPUT
+            echo "SSH_KEY=${{ secrets.PROD_EC2_SSH_KEY }}" >> $GITHUB_OUTPUT
+            echo "CONTAINER_NAME=nextjs-prod" >> $GITHUB_OUTPUT
+            echo "HOST_PORT=80" >> $GITHUB_OUTPUT
+          else
+            echo "Invalid environment for rollback: ${{ github.event.inputs.environment }}. Exiting."
+            exit 1
+          fi
+          echo "APP_PORT=3000" >> $GITHUB_OUTPUT # Internal app port
+          echo "--- Rollback variables set ---"
+
+      - name: Install SSH Key for Rollback Deployment
+        run: |
+          echo "--- Installing SSH Key for rollback EC2 connection ---"
+          echo "${{ steps.vars.outputs.SSH_KEY }}" > key.pem
+          chmod 600 key.pem
+          echo "--- SSH Key installed for rollback ---"
+
+      - name: Perform Rollback Deployment to EC2
+        run: |
+          echo "--- Starting rollback deployment to EC2 instance: ${{ steps.vars.outputs.SERVER_IP }} ---"
+          
+          ROLLBACK_IMAGE="${{ steps.vars.outputs.ECR_URI }}:${{ steps.vars.outputs.ROLLBACK_IMAGE_TAG }}"
+          CONTAINER_NAME="${{ steps.vars.outputs.CONTAINER_NAME }}"
+          HOST_PORT="${{ steps.vars.outputs.HOST_PORT }}"
+          APP_PORT="${{ steps.vars.outputs.APP_PORT }}"
+
+          ssh -o StrictHostKeyChecking=no -i key.pem ${{ secrets.DEPLOY_USER }}@${{ steps.vars.outputs.SERVER_IP }} << 'EOF'
+            echo "Server: Pulling rollback Docker image: ${ROLLBACK_IMAGE}"
+            docker pull "${ROLLBACK_IMAGE}"
+            echo "Server: Rollback Docker image pulled."
+
+            echo "Server: Stopping and removing current container: ${CONTAINER_NAME}"
+            docker stop "${CONTAINER_NAME}" || true
+            docker rm "${CONTAINER_NAME}" || true
+            echo "Server: Current container stopped and removed."
+
+            echo "Server: Running rollback container: ${CONTAINER_NAME} with image ${ROLLBACK_IMAGE}"
+            # IMPORTANT: Ensure environment variables here match what the rolled-back version needs
+            docker run -d \
+              --name "${CONTAINER_NAME}" \
+              -p "${HOST_PORT}":"${APP_PORT}" \
+              -e "NODE_ENV=production" \
+              -e "NEXT_PUBLIC_API_URL=https://your-backend-api.com" \ # EXAMPLE ENV VAR
+              "${ROLLBACK_IMAGE}"
+            echo "Server: Rollback container started."
+            
+            echo "Server: Cleaning up old Docker images to free space."
+            docker image prune -f
+            echo "Server: Old Docker images pruned."
+
+            echo "Server: Rollback process completed."
+          EOF
+          echo "--- Rollback to EC2 finished ---"
+          rm key.pem # Clean up SSH key from runner   
+
+
+                
