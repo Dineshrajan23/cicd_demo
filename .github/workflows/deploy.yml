@@ -1,12 +1,12 @@
-name: Frontend CI/CD Pipeline
+name: Frontend CI/CD Pipeline (Dockerized)
 
 on:
   push:
     branches:
       - dev
       - staging
-      - production 
-  pull_request: 
+      - production
+  pull_request:
     branches:
       - dev
       - staging
@@ -28,286 +28,126 @@ on:
           - production
         default: 'production'
 
-
 permissions:
-  contents: read 
-  actions: write 
-  pull-requests: write 
-  deployments: write 
+  contents: read
+  actions: write
+  pull-requests: write
+  deployments: write
 
 jobs:
-  build:
-    name: Build & Test
+  build_and_push_docker_image:
+    name: Build & Push Docker Image
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v3
         with:
-          node-version: '18'
-          cache: 'npm' 
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-south-1 
 
-      - name: Install dependencies
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set Image Tag and ECR URI
+        id: image_vars
         run: |
-          npm ci
+          # Use SHA as tag for unique identification, useful for rollback/history
+          IMAGE_TAG="${{ github.sha }}"
+          ECR_URI="${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY_NAME }}"
+          echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "ECR_URI=$ECR_URI" >> $GITHUB_OUTPUT
+          echo "Building image: $ECR_URI:$IMAGE_TAG"
 
-      - name: Run Lint
+      - name: Build and push Docker image to ECR
         run: |
-          npm run lint
+          docker build -t ${{ steps.image_vars.outputs.ECR_URI }}:${{ steps.image_vars.outputs.IMAGE_TAG }} .
+          docker push ${{ steps.image_vars.outputs.ECR_URI }}:${{ steps.image_vars.outputs.IMAGE_TAG }}
 
-      - name: Build Next.js Application and Archive
-        run: |
-          npm run build
-          ls -la .next || { echo ".next directory was not created during build. Build failed?"; exit 1; }
-
-          # --- NEW STEP: Archive the .next directory ---
-          echo "--- Archiving .next directory to frontend-build.tar.gz ---"
-          # Ensure you are in the correct directory. 'tar -C' changes directory before archiving.
-          # We want to archive the .next directory, relative to the current working directory.
-          tar -czf frontend-build.tar.gz .next/
-          echo "--- Archive created successfully. Listing archive details: ---"
-          ls -lh frontend-build.tar.gz || { echo "Failed to create archive!"; exit 1; }
-          # --- END NEW STEP ---
-
-      # - name: Run Tests # Uncomment if you have tests (e.g., Jest, React Testing Library)
-      #   run: |
-      #     echo "--- Running tests ---"
-      #     npm test
-      #     echo "--- Tests completed ---"
-
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: frontend-build 
-          path: frontend-build.tar.gz 
-          if-no-files-found: error
-          compression-level: 0 
-          overwrite: true
+          # For 'latest' tag, only push on main branch
+          if [[ "${{ github.ref }}" == "refs/heads/production" ]]; then
+            docker tag ${{ steps.image_vars.outputs.ECR_URI }}:${{ steps.image_vars.outputs.IMAGE_TAG }} ${{ steps.image_vars.outputs.ECR_URI }}:latest
+            docker push ${{ steps.image_vars.outputs.ECR_URI }}:latest
+            echo "Pushed latest tag for production."
+          fi
 
   deploy:
-    name: Deploy to ${{ github.ref == 'refs/heads/production' && 'Production' || (github.ref == 'refs/heads/staging' && 'Staging' || 'Development') }}
-    needs: build
+    name: Deploy Docker Image to ${{ github.ref == 'refs/heads/production' && 'Production' || (github.ref == 'refs/heads/staging' && 'Staging' || 'Development') }}
+    needs: build_and_push_docker_image 
     runs-on: ubuntu-latest
-    # Manual approval for production
     environment:
       name: ${{ github.ref == 'refs/heads/production' && 'production' || (github.ref == 'refs/heads/staging' && 'staging' || 'development') }}
-      url: ${{ github.ref == 'refs/heads/production' && 'https://your-production-url.com' || github.ref == 'refs/heads/staging' && 'https://your-staging-url.com' || 'https://your-dev-url.com' }}
+      url: ${{ github.ref == 'refs/heads/production' && 'https://production-url.com' || github.ref == 'refs/heads/staging' && 'https://staging-url.com' || 'https://dev-url.com' }} 
 
     steps:
-      - name: Download build artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: frontend-build
-          path: ./downloaded-build
-
-      - name: Extract downloaded artifact
-        run: |
-          echo "--- Extracting downloaded build artifact ---"
-          # Verify the tarball exists within the downloaded-build directory
-          ls -la ./downloaded-build/frontend-build.tar.gz || { echo "Downloaded artifact (frontend-build.tar.gz) not found in ./downloaded-build!"; exit 1; }
-
-          # Extract the tarball. The -C flag tells tar to change directory before extracting.
-          # The .next directory was archived from the root of the build context,
-          # so extracting it will put it directly into ./downloaded-build/.next
-          tar -xzf ./downloaded-build/frontend-build.tar.gz -C ./downloaded-build/
-          echo "--- Artifact extracted. Listing contents of ./downloaded-build: ---"
-          ls -la ./downloaded-build/ # Verify the .next directory is now there
-          echo "--- Verifying extracted .next directory: ---"
-          ls -la ./downloaded-build/.next || { echo "Extracted .next directory not found in ./downloaded-build!"; exit 1; }
-          
-          # Optional: Clean up the tarball after extraction on the runner
-          rm ./downloaded-build/frontend-build.tar.gz
-          echo "--- Artifact extraction verified and tarball cleaned up ---"
-
       - name: Set deployment variables
-        id: vars 
+        id: vars
         run: |
           echo "--- Setting deployment variables based on branch ---"
           if [[ "${{ github.ref }}" == "refs/heads/dev" ]]; then
-            echo "DEPLOY_ENV=dev" >> $GITHUB_OUTPUT
             echo "SERVER_IP=${{ secrets.DEV_SERVER_IP }}" >> $GITHUB_OUTPUT
             echo "SSH_KEY=${{ secrets.DEV_EC2_SSH_KEY }}" >> $GITHUB_OUTPUT
-            echo "APP_DIR=${{ secrets.DEV_APP_DIR }}" >> $GITHUB_OUTPUT # e.g., /var/www/dev-app
+            echo "CONTAINER_NAME=nextjs-dev" >> $GITHUB_OUTPUT # Unique name for container
+            echo "APP_PORT=3000" >> $GITHUB_OUTPUT # Internal app port
+            echo "HOST_PORT=3000" >> $GITHUB_OUTPUT # Host port to map
           elif [[ "${{ github.ref }}" == "refs/heads/staging" ]]; then
-            echo "DEPLOY_ENV=staging" >> $GITHUB_OUTPUT
             echo "SERVER_IP=${{ secrets.STAGING_SERVER_IP }}" >> $GITHUB_OUTPUT
             echo "SSH_KEY=${{ secrets.STAGING_EC2_SSH_KEY }}" >> $GITHUB_OUTPUT
-            echo "APP_DIR=${{ secrets.STAGING_APP_DIR }}" >> $GITHUB_OUTPUT # e.g., /var/www/staging-app
+            echo "CONTAINER_NAME=nextjs-staging" >> $GITHUB_OUTPUT
+            echo "APP_PORT=3000" >> $GITHUB_OUTPUT
+            echo "HOST_PORT=3000" >> $GITHUB_OUTPUT
           elif [[ "${{ github.ref }}" == "refs/heads/production" ]]; then
-            echo "DEPLOY_ENV=production" >> $GITHUB_OUTPUT
             echo "SERVER_IP=${{ secrets.PROD_SERVER_IP }}" >> $GITHUB_OUTPUT
             echo "SSH_KEY=${{ secrets.PROD_EC2_SSH_KEY }}" >> $GITHUB_OUTPUT
-            echo "APP_DIR=${{ secrets.PROD_APP_DIR }}" >> $GITHUB_OUTPUT # e.g., /var/www/your-app
+            echo "CONTAINER_NAME=nextjs-prod" >> $GITHUB_OUTPUT
+            echo "APP_PORT=3000" >> $GITHUB_OUTPUT
+            echo "HOST_PORT=80" >> $GITHUB_OUTPUT # Production usually uses port 80/443
           else
             echo "Unknown branch ref: ${{ github.ref }}. Exiting."
             exit 1
           fi
+          # Get image URI and tag from the build_and_push_docker_image job's outputs
+          echo "ECR_URI=${{ needs.build_and_push_docker_image.outputs.ECR_URI }}" >> $GITHUB_OUTPUT
+          echo "IMAGE_TAG=${{ needs.build_and_push_docker_image.outputs.IMAGE_TAG }}" >> $GITHUB_OUTPUT
           echo "--- Deployment variables set ---"
 
-      - name: Save Git Tag for Production (only on main branch)
-        if: github.ref == 'refs/heads/production'
+      - name: Deploy Docker container to EC2 via SSH
         run: |
-          echo "--- Tagging production deployment ---"
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          TAG_NAME="prod-release-$(date +'%Y%m%d%H%M%S')-${{ github.sha }}"
-          git tag $TAG_NAME
-          git push origin $TAG_NAME
-          echo "--- Production deployment tagged: $TAG_NAME ---"
-          # Store the tag name for potential use in deployment status/monitoring
-          echo "PROD_DEPLOY_TAG=$TAG_NAME" >> $GITHUB_OUTPUT # Not used directly in this workflow, but useful
-
-      - name: Deploy to EC2 via SCP and SSH
-        run: |
-          echo "--- Starting deployment to EC2 instance: ${{ steps.vars.outputs.SERVER_IP }} ---"
+          echo "--- Starting Docker deployment to EC2 instance: ${{ steps.vars.outputs.SERVER_IP }} ---"
           echo "${{ steps.vars.outputs.SSH_KEY }}" > key.pem
           chmod 600 key.pem
 
+          IMAGE_TO_DEPLOY="${{ steps.vars.outputs.ECR_URI }}:${{ steps.vars.outputs.IMAGE_TAG }}"
+          CONTAINER_NAME="${{ steps.vars.outputs.CONTAINER_NAME }}"
+          HOST_PORT="${{ steps.vars.outputs.HOST_PORT }}"
+          APP_PORT="${{ steps.vars.outputs.APP_PORT }}"
 
-          echo "--- Creating tarball of extracted .next for transfer to EC2 ---"
-
-          tar -czf next_for_transfer.tar.gz -C ./downloaded-build .next
-          echo "--- Tarball for transfer created ---"
-
-
-          echo "--- Transferring build artifact to EC2 ---"
-          scp -o StrictHostKeyChecking=no -i key.pem next_for_transfer.tar.gz ${{ secrets.DEPLOY_USER }}@${{ steps.vars.outputs.SERVER_IP }}:/tmp/next_for_transfer.tar.gz
-          echo "--- Artifact transferred ---"
-
-          # SSH into the EC2 instance and perform deployment steps
-          ssh -o StrictHostKeyChecking=no -i key.pem ${{ secrets.DEPLOY_USER }}@${{ steps.vars.outputs.SERVER_IP }} << 'EOF'
-            APP_DIR="${{ steps.vars.outputs.APP_DIR }}"
-            TIMESTAMP=$(date +'%Y%m%d%H%M%S')
-            BACKUP_DIR="$HOME/backups/${APP_DIR##*/}-backup-$TIMESTAMP"
-            BUILD_TARBALL="/tmp/next_for_transfer.tar.gz"
-
-            echo "Server: Starting deployment for application in \$APP_DIR"
-
-            if [ -d "\$APP_DIR" ]; then
-                echo "Server: Current application directory found. Creating backup to \$BACKUP_DIR"
-                mkdir -p "\$BACKUP_DIR"
-                cp -r "\$APP_DIR/.next" "\$BACKUP_DIR/" 2>/dev/null || echo "Server: .next folder not found in current deployment, skipping .next backup."
-                cp "\$APP_DIR/package.json" "\$BACKUP_DIR/" 2>/dev/null || echo "Server: package.json not found, skipping backup."
-                cp "\$APP_DIR/next.config.ts" "\$BACKUP_DIR/" 2>/dev/null || echo "Server: next.config.ts not found, skipping backup."
-                cp -r "\$APP_DIR/public" "\$BACKUP_DIR/" 2>/dev/null || echo "Server: public folder not found, skipping backup."
-                echo "Server: Backup completed."
-            else
-                echo "Server: Application directory \$APP_DIR does not exist. Creating it."
-                mkdir -p "\$APP_DIR"
-            fi
-
-            echo "Server: Removing old .next folder and extracting new build from \$BUILD_TARBALL"
-            rm -rf "\$APP_DIR/.next"
-            tar -xzf "\$BUILD_TARBALL" -C "\$APP_DIR"
-
-            echo "Server: Cleaning up build tarball: \$BUILD_TARBALL"
-            rm "\$BUILD_TARBALL"
-
-            echo "Server: Attempting to restart PM2 process 'your-app'..."
-            pm2 restart your-app || \
-            (echo "Server: PM2 process 'your-app' not found or failed to restart. Attempting to start as new process." && \
-             pm2 start npm --name your-app -- run start --cwd "\$APP_DIR") || \
-             echo "Server: Failed to manage PM2 process. Manual intervention may be required."
-
-            echo "Server: Deployment process completed successfully for \${APP_DIR}."
-          EOF
-          echo "--- Deployment to EC2 finished ---"
-          rm key.pem
-          rm next_for_transfer.tar.gz # Clean up the tarball on the runner
-
-  rollback:
-    name: Rollback Deployment
-    if: github.event_name == 'workflow_dispatch' && github.event.inputs.rollback_tag != ''
-    runs-on: ubuntu-latest
-    needs: build 
-
-    steps:
-      - name: Checkout specified tag for rollback
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.inputs.rollback_tag }}
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '18'
-          cache: 'npm'
-
-      - name: Install dependencies for rollback build
-        run: |
-          echo "--- Installing dependencies for rollback build ---"
-          npm ci
-          echo "--- Dependencies installed ---"
-
-      - name: Build application for rollback
-        run: |
-          echo "--- Building application for rollback from tag: ${{ github.event.inputs.rollback_tag }} ---"
-          npm run build
-          echo "--- Rollback build completed ---"
-          ls -la .next || { echo ".next directory was not created during rollback build. Build failed?"; exit 1; }
-
-      - name: Set rollback deployment variables
-        id: vars
-        run: |
-          echo "--- Setting rollback variables for environment: ${{ github.event.inputs.environment }} ---"
-          if [[ "${{ github.event.inputs.environment }}" == "dev" ]]; then
-            echo "SERVER_IP=${{ secrets.DEV_SERVER_IP }}" >> $GITHUB_OUTPUT
-            echo "SSH_KEY=${{ secrets.DEV_EC2_SSH_KEY }}" >> $GITHUB_OUTPUT
-            echo "APP_DIR=${{ secrets.DEV_APP_DIR }}" >> $GITHUB_OUTPUT
-          elif [[ "${{ github.event.inputs.environment }}" == "staging" ]]; then
-            echo "SERVER_IP=${{ secrets.STAGING_SERVER_IP }}" >> $GITHUB_OUTPUT
-            echo "SSH_KEY=${{ secrets.STAGING_EC2_SSH_KEY }}" >> $GITHUB_OUTPUT
-            echo "APP_DIR=${{ secrets.STAGING_APP_DIR }}" >> $GITHUB_OUTPUT
-          elif [[ "${{ github.event.inputs.environment }}" == "production" ]]; then
-            echo "SERVER_IP=${{ secrets.PROD_SERVER_IP }}" >> $GITHUB_OUTPUT
-            echo "SSH_KEY=${{ secrets.PROD_EC2_SSH_KEY }}" >> $GITHUB_OUTPUT
-            echo "APP_DIR=${{ secrets.PROD_APP_DIR }}" >> $GITHUB_OUTPUT
-          else
-            echo "Invalid environment for rollback: ${{ github.event.inputs.environment }}. Exiting."
-            exit 1
-          fi
-          echo "--- Rollback variables set ---"
-
-      - name: Perform Rollback Deployment to EC2
-        run: |
-          echo "--- Starting rollback deployment to EC2 instance: ${{ steps.vars.outputs.SERVER_IP }} ---"
-          echo "${{ steps.vars.outputs.SSH_KEY }}" > key.pem
-          chmod 600 key.pem
-
-          echo "--- Creating tarball of rollback build artifact ---"
-          tar -czf next_rollback_build.tar.gz ./.next
-          echo "--- Tarball created ---"
-
-          echo "--- Transferring rollback build artifact to EC2 ---"
-          scp -o StrictHostKeyChecking=no -i key.pem next_rollback_build.tar.gz ${{ secrets.DEPLOY_USER }}@${{ steps.vars.outputs.SERVER_IP }}:/tmp/next_rollback_build.tar.gz
-          echo "--- Artifact transferred ---"
-
-          echo "--- Executing rollback commands on EC2 ---"
           ssh -o StrictHostKeyChecking=no -i key.pem ${{ secrets.DEPLOY_USER }}@${{ steps.vars.outputs.SERVER_IP }} << EOF
-            APP_DIR="${{ steps.vars.outputs.APP_DIR }}"
-            BUILD_TARBALL="/tmp/next_rollback_build.tar.gz"
+            echo "Server: Pulling Docker image: \${IMAGE_TO_DEPLOY}"
+            docker pull "\${IMAGE_TO_DEPLOY}"
 
-            echo "Server: Starting rollback for \${APP_DIR} to tag: ${{ github.event.inputs.rollback_tag }}"
+            echo "Server: Stopping and removing old container (if exists): \${CONTAINER_NAME}"
+            docker stop "\${CONTAINER_NAME}" || true
+            docker rm "\${CONTAINER_NAME}" || true
 
-            # No backup during rollback, as we are already restoring a known good state.
-            # If you want to backup the current (potentially broken) state before rollback,
-            # you can add similar backup logic here as in the deploy job.
+            echo "Server: Running new container: \${CONTAINER_NAME} on port \${HOST_PORT}:\${APP_PORT}"
+            # Run the new container, mapping host port to container port
+            # Add any necessary environment variables for your app here using -e
+            docker run -d \
+              --name "\${CONTAINER_NAME}" \
+              -p "\${HOST_PORT}":"\${APP_PORT}" \
+              -e "NODE_ENV=production" \
+              -e "NEXT_PUBLIC_API_URL=https://api-url.com" \ 
+              "\${IMAGE_TO_DEPLOY}"
 
-            echo "Server: Extracting rollback build artifact from \$BUILD_TARBALL to \$APP_DIR"
-            rm -rf "\$APP_DIR/.next" # Remove current (potentially problematic) .next
-            tar -xzf "\$BUILD_TARBALL" -C "\$APP_DIR" # Extract rollback .next
+            echo "Server: Cleaning up old Docker images to free space"
+            docker image prune -f
 
-            echo "Server: Cleaning up rollback tarball"
-            rm "\$BUILD_TARBALL"
-
-            echo "Server: Restarting application 'your-app' via PM2..."
-            pm2 restart your-app || (echo "Server: PM2 process 'your-app' not found. Attempting to start." && pm2 start --name your-app "npm run start" --cwd "\$APP_DIR") || echo "Server: Failed to manage PM2 process during rollback."
-
-            echo "Server: Rollback process completed."
+            echo "Server: Docker deployment process completed successfully."
           EOF
-          echo "--- Rollback to EC2 finished ---"
+          echo "--- Docker deployment to EC2 finished ---"
           rm key.pem
-
-          echo "--completed Rollback Deployment---"
